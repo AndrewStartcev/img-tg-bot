@@ -37,7 +37,7 @@ PNG обратно в Telegram
 - 32 GB RAM;
 - 128 GB SSD.
 
-По умолчанию используется `addlabsviral/Qwen-Image-2.1-4bit`: Diffusers-сборка Qwen-Image-2.1, в которой transformer и Qwen3-VL text encoder упакованы в 4-bit FP4, а VAE остаётся BF16. Это значительно снижает требования к VRAM.
+По умолчанию используется официальный `Qwen/Qwen-Image-2.1`. При загрузке бот сам квантует transformer и Qwen3-VL text encoder в 4-bit FP4 через bitsandbytes, VAE остаётся BF16. Это снижает требования к VRAM и не зависит от стороннего квантованного репозитория.
 
 ## 1. Создать Telegram-бота
 
