@@ -78,7 +78,7 @@ def load_settings() -> Settings:
         access_prefix=prefix,
         allowed_user_ids=_ids("ALLOWED_USER_IDS"),
         model_id=os.getenv(
-            "QWEN_MODEL_ID", "addlabsviral/Qwen-Image-2.1-4bit"
+            "QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1"
         ).strip(),
         hf_token=os.getenv("HF_TOKEN", "").strip() or None,
         hf_home=hf_home,
