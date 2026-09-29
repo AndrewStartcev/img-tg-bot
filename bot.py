@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 from io import BytesIO
@@ -117,7 +118,7 @@ async def run_generate(message: Message, prompt: str) -> None:
         await status.edit_text(
             "❌ Ошибка генерации. Посмотри журнал сервиса:\n"
             "<code>journalctl -u img-tg-bot -n 100 --no-pager</code>\n\n"
-            f"<code>{type(exc).__name__}: {str(exc)[:500]}</code>",
+            f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
             parse_mode="HTML",
         )
 
@@ -178,7 +179,7 @@ async def run_edit(message: Message, prompt: str) -> None:
         await status.edit_text(
             "❌ Ошибка редактирования. Посмотри журнал сервиса:\n"
             "<code>journalctl -u img-tg-bot -n 100 --no-pager</code>\n\n"
-            f"<code>{type(exc).__name__}: {str(exc)[:500]}</code>",
+            f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
             parse_mode="HTML",
         )
 
@@ -259,7 +260,7 @@ async def text_handler(message: Message) -> None:
             logger.exception("Warmup failed")
             await status.edit_text(
                 f"❌ Не удалось загрузить модель:\n"
-                f"<code>{type(exc).__name__}: {str(exc)[:500]}</code>",
+                f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
                 parse_mode="HTML",
             )
         return
