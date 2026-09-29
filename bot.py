@@ -4,10 +4,12 @@ import html
 import json
 import logging
 import os
+import socket
 import time
 from io import BytesIO
 
 import requests
+import urllib3.util.connection as urllib3_connection
 from PIL import Image, UnidentifiedImageError
 
 from config import Settings, load_settings
@@ -19,6 +21,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("img-tg-bot")
+
+# Force IPv4 for requests/urllib3: this VM has unrouted IPv6 for Telegram API.
+urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 settings: Settings = load_settings()
 engine = QwenEngine(settings)
