@@ -4,9 +4,11 @@ import asyncio
 import html
 import logging
 import os
+import socket
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 from PIL import Image, UnidentifiedImageError
@@ -282,21 +284,64 @@ async def preload_if_enabled() -> None:
 
 
 async def main() -> None:
-    bot = Bot(token=settings.telegram_bot_token)
+    # На части российских/облачных сетей api.telegram.org по IPv6 может
+    # зависать, хотя IPv4 работает. Принудительно используем IPv4.
+    session = AiohttpSession(timeout=60)
+    session._connector_init["family"] = socket.AF_INET
 
-    # Убираем старый webhook: используем long polling, открытые порты не нужны.
-    await bot.delete_webhook(drop_pending_updates=False)
+    bot = Bot(
+        token=settings.telegram_bot_token,
+        session=session,
+    )
+
+    # Убираем старый webhook. Сетевой сбой при старте не должен убивать
+    # systemd-процесс: делаем несколько попыток.
+    webhook_deleted = False
+    for attempt in range(1, 6):
+        try:
+            await bot.delete_webhook(
+                drop_pending_updates=False,
+                request_timeout=60,
+            )
+            webhook_deleted = True
+            break
+        except Exception as exc:
+            logger.warning(
+                "deleteWebhook attempt %s/5 failed: %s: %s",
+                attempt,
+                type(exc).__name__,
+                exc,
+            )
+            await asyncio.sleep(min(5 * attempt, 20))
+
+    if not webhook_deleted:
+        logger.warning(
+            "Could not confirm webhook deletion. Starting polling anyway; "
+            "if a webhook is configured Telegram will report a conflict."
+        )
 
     if settings.model_load_on_start:
         asyncio.create_task(preload_if_enabled())
 
-    me = await bot.get_me()
-    logger.info("Bot @%s started", me.username)
+    try:
+        me = await bot.get_me(request_timeout=60)
+        logger.info("Bot @%s started", me.username)
+    except Exception as exc:
+        # Сам polling aiogram умеет восстанавливать после сетевых ошибок,
+        # поэтому getMe не должен быть фатальным.
+        logger.warning(
+            "getMe failed at startup: %s: %s. Starting polling.",
+            type(exc).__name__,
+            exc,
+        )
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=dp.resolve_used_update_types(),
-    )
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
