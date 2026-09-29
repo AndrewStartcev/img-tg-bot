@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import html
+import json
 import logging
 import os
-import socket
+import time
 from io import BytesIO
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+import requests
 from PIL import Image, UnidentifiedImageError
 
 from config import Settings, load_settings
@@ -25,16 +22,194 @@ logger = logging.getLogger("img-tg-bot")
 
 settings: Settings = load_settings()
 engine = QwenEngine(settings)
-dp = Dispatcher()
-
-# Одна генерация/правка за раз. Для одной A10 это правильнее и стабильнее.
-gpu_queue = asyncio.Lock()
 
 
-def user_allowed(message: Message) -> bool:
+class TelegramAPI:
+    def __init__(self, token: str) -> None:
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.file_base = f"https://api.telegram.org/file/bot{token}"
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "img-tg-bot/1.0"})
+
+    def call(
+        self,
+        method: str,
+        *,
+        data: dict | None = None,
+        params: dict | None = None,
+        files: dict | None = None,
+        timeout: tuple[int, int] = (10, 60),
+    ):
+        url = f"{self.base}/{method}"
+        response = self.session.post(
+            url,
+            data=data,
+            params=params,
+            files=files,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if not payload.get("ok"):
+            raise RuntimeError(
+                f"Telegram {method}: {payload.get('error_code')} "
+                f"{payload.get('description', 'unknown error')}"
+            )
+        return payload.get("result")
+
+    def get_updates(self, offset: int | None) -> list[dict]:
+        params = {
+            "timeout": 25,
+            "allowed_updates": json.dumps(["message"]),
+        }
+        if offset is not None:
+            params["offset"] = offset
+
+        # getUpdates лучше делать GET: это максимально близко к curl,
+        # который стабильно работает на Intelion.
+        response = self.session.get(
+            f"{self.base}/getUpdates",
+            params=params,
+            timeout=(10, 40),
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if not payload.get("ok"):
+            raise RuntimeError(
+                f"Telegram getUpdates: {payload.get('error_code')} "
+                f"{payload.get('description', 'unknown error')}"
+            )
+
+        return payload.get("result", [])
+
+    def get_me(self) -> dict:
+        response = self.session.get(
+            f"{self.base}/getMe",
+            timeout=(10, 20),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("description", "getMe failed"))
+        return payload["result"]
+
+    def delete_webhook(self) -> None:
+        response = self.session.get(
+            f"{self.base}/deleteWebhook",
+            params={"drop_pending_updates": "false"},
+            timeout=(10, 20),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("description", "deleteWebhook failed"))
+
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        parse_mode: str | None = None,
+    ) -> dict:
+        data = {"chat_id": str(chat_id), "text": text}
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        return self.call("sendMessage", data=data)
+
+    def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        parse_mode: str | None = None,
+    ) -> None:
+        data = {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "text": text,
+        }
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        self.call("editMessageText", data=data)
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        try:
+            self.call(
+                "deleteMessage",
+                data={
+                    "chat_id": str(chat_id),
+                    "message_id": str(message_id),
+                },
+                timeout=(10, 20),
+            )
+        except Exception:
+            logger.debug("Could not delete status message", exc_info=True)
+
+    def send_result(
+        self,
+        chat_id: int,
+        image_bytes: bytes,
+        seed: int,
+    ) -> None:
+        filename = f"qwen-{seed}.png"
+        caption = f"✅ Готово · seed {seed}"
+
+        if settings.send_as_document:
+            self.call(
+                "sendDocument",
+                data={"chat_id": str(chat_id), "caption": caption},
+                files={
+                    "document": (
+                        filename,
+                        image_bytes,
+                        "image/png",
+                    )
+                },
+                timeout=(15, 180),
+            )
+        else:
+            self.call(
+                "sendPhoto",
+                data={"chat_id": str(chat_id), "caption": caption},
+                files={
+                    "photo": (
+                        filename,
+                        image_bytes,
+                        "image/png",
+                    )
+                },
+                timeout=(15, 180),
+            )
+
+    def download_file(self, file_id: str) -> bytes:
+        info = self.call(
+            "getFile",
+            data={"file_id": file_id},
+            timeout=(10, 30),
+        )
+        path = info["file_path"]
+
+        response = self.session.get(
+            f"{self.file_base}/{path}",
+            timeout=(10, 120),
+        )
+        response.raise_for_status()
+        return response.content
+
+
+tg = TelegramAPI(settings.telegram_bot_token)
+
+
+def user_allowed(message: dict) -> bool:
     if not settings.allowed_user_ids:
         return True
-    return bool(message.from_user and message.from_user.id in settings.allowed_user_ids)
+
+    user = message.get("from") or {}
+    user_id = user.get("id")
+    return bool(user_id and int(user_id) in settings.allowed_user_ids)
 
 
 def extract_prompt(raw: str | None) -> str | None:
@@ -49,7 +224,7 @@ def extract_prompt(raw: str | None) -> str | None:
 
     tail = text[len(prefix):]
 
-    # Не считаем "12345 ..." корректным паролем "1234".
+    # "12345 ..." не считаем паролем "1234".
     if tail and not (tail[0].isspace() or tail[0] in ":,-"):
         return None
 
@@ -61,183 +236,110 @@ def extract_prompt(raw: str | None) -> str | None:
     return prompt
 
 
-async def auth_prompt(message: Message, raw: str | None) -> str | None:
-    if not user_allowed(message):
-        return None
-
-    prompt = extract_prompt(raw)
-    if prompt is None:
-        if not settings.silent_auth_failure:
-            await message.answer("🔒 В начале сообщения нужен пароль.")
-        return None
-
-    return prompt
-
-
-async def send_result(message: Message, image_bytes: bytes, seed: int) -> None:
-    filename = f"qwen-{seed}.png"
-    upload = BufferedInputFile(image_bytes, filename=filename)
-
-    if settings.send_as_document:
-        await message.answer_document(
-            upload,
-            caption=f"✅ Готово · seed {seed}",
+def status_error(chat_id: int, status_id: int, exc: Exception) -> None:
+    error = html.escape(str(exc)[:700])
+    try:
+        tg.edit_message(
+            chat_id,
+            status_id,
+            "❌ Ошибка. Посмотри журнал сервиса:\n"
+            "<code>journalctl -u img-tg-bot -n 100 --no-pager</code>\n\n"
+            f"<code>{type(exc).__name__}: {error}</code>",
+            parse_mode="HTML",
         )
-    else:
-        await message.answer_photo(
-            upload,
-            caption=f"✅ Готово · seed {seed}",
-        )
+    except Exception:
+        logger.exception("Could not report error to Telegram")
 
 
-async def run_generate(message: Message, prompt: str) -> None:
+def run_generate(chat_id: int, prompt: str) -> None:
     if not prompt:
-        await message.answer(
+        tg.send_message(
+            chat_id,
             f"Напиши после пароля, что создать.\n"
             f"Например: <code>{settings.access_prefix} "
-            f"фотореалистичный автомобиль ночью</code>",
+            "фотореалистичный автомобиль ночью</code>",
             parse_mode="HTML",
         )
         return
 
-    status = await message.answer("⏳ Генерирую изображение…")
+    status = tg.send_message(chat_id, "⏳ Генерирую изображение…")
+    status_id = status["message_id"]
 
     try:
-        async with gpu_queue:
-            image, seed = await asyncio.to_thread(engine.generate, prompt)
-            image_bytes = await asyncio.to_thread(engine.to_png_bytes, image)
-
-        await send_result(message, image_bytes, seed)
-        await status.delete()
-        logger.info(
-            "generation completed user_id=%s seed=%s",
-            message.from_user.id if message.from_user else None,
-            seed,
-        )
-
+        image, seed = engine.generate(prompt)
+        image_bytes = engine.to_png_bytes(image)
+        tg.send_result(chat_id, image_bytes, seed)
+        tg.delete_message(chat_id, status_id)
+        logger.info("Generation completed seed=%s", seed)
     except Exception as exc:
         logger.exception("Generation failed")
-        await status.edit_text(
-            "❌ Ошибка генерации. Посмотри журнал сервиса:\n"
-            "<code>journalctl -u img-tg-bot -n 100 --no-pager</code>\n\n"
-            f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
-            parse_mode="HTML",
-        )
+        status_error(chat_id, status_id, exc)
 
 
-async def download_input_image(message: Message) -> Image.Image:
-    buffer = BytesIO()
+def image_from_message(message: dict) -> Image.Image:
+    file_id: str | None = None
 
-    if message.photo:
-        await message.bot.download(message.photo[-1], destination=buffer)
-    elif (
-        message.document
-        and message.document.mime_type
-        and message.document.mime_type.startswith("image/")
-    ):
-        await message.bot.download(message.document, destination=buffer)
-    else:
-        raise ValueError("В сообщении нет изображения.")
+    photos = message.get("photo") or []
+    if photos:
+        file_id = photos[-1].get("file_id")
 
-    buffer.seek(0)
+    if not file_id:
+        document = message.get("document") or {}
+        mime = document.get("mime_type", "")
+        if mime.startswith("image/"):
+            file_id = document.get("file_id")
+
+    if not file_id:
+        raise ValueError("В сообщении нет поддерживаемого изображения.")
+
+    raw = tg.download_file(file_id)
 
     try:
-        image = Image.open(buffer)
+        image = Image.open(BytesIO(raw))
         image.load()
         return image
     except UnidentifiedImageError as exc:
         raise ValueError("Telegram прислал неподдерживаемый файл изображения.") from exc
 
 
-async def run_edit(message: Message, prompt: str) -> None:
+def run_edit(chat_id: int, message: dict, prompt: str) -> None:
     if not prompt:
-        await message.answer(
-            f"Добавь к фотографии подпись, начинающуюся с пароля.\n"
+        tg.send_message(
+            chat_id,
+            "Добавь к фотографии подпись, начинающуюся с пароля.\n"
             f"Например: <code>{settings.access_prefix} "
-            f"убери очки, остальное не меняй</code>",
+            "убери очки, остальное не меняй</code>",
             parse_mode="HTML",
         )
         return
 
-    status = await message.answer("⏳ Загружаю фото и редактирую…")
+    status = tg.send_message(chat_id, "⏳ Загружаю фото и редактирую…")
+    status_id = status["message_id"]
 
     try:
-        source = await download_input_image(message)
-
-        async with gpu_queue:
-            image, seed = await asyncio.to_thread(engine.edit, prompt, source)
-            image_bytes = await asyncio.to_thread(engine.to_png_bytes, image)
-
-        await send_result(message, image_bytes, seed)
-        await status.delete()
-        logger.info(
-            "edit completed user_id=%s seed=%s",
-            message.from_user.id if message.from_user else None,
-            seed,
-        )
-
+        source = image_from_message(message)
+        image, seed = engine.edit(prompt, source)
+        image_bytes = engine.to_png_bytes(image)
+        tg.send_result(chat_id, image_bytes, seed)
+        tg.delete_message(chat_id, status_id)
+        logger.info("Edit completed seed=%s", seed)
     except Exception as exc:
         logger.exception("Edit failed")
-        await status.edit_text(
-            "❌ Ошибка редактирования. Посмотри журнал сервиса:\n"
-            "<code>journalctl -u img-tg-bot -n 100 --no-pager</code>\n\n"
-            f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
-            parse_mode="HTML",
-        )
+        status_error(chat_id, status_id, exc)
 
 
-@dp.message(Command("start"))
-async def start_handler(message: Message) -> None:
-    # /start не запускает модель и не раскрывает пароль.
-    if not user_allowed(message):
-        return
-
-    await message.answer(
-        "Бот запущен.\n\n"
-        "• Текст с правильным префиксом → генерация.\n"
-        "• Фото + подпись с правильным префиксом → редактирование.\n"
-        "• Команды также пишутся после префикса.",
-    )
-
-
-@dp.message(F.photo)
-async def photo_handler(message: Message) -> None:
-    prompt = await auth_prompt(message, message.caption)
-    if prompt is None:
-        return
-    await run_edit(message, prompt)
-
-
-@dp.message(F.document)
-async def document_handler(message: Message) -> None:
-    if not (
-        message.document
-        and message.document.mime_type
-        and message.document.mime_type.startswith("image/")
-    ):
-        return
-
-    prompt = await auth_prompt(message, message.caption)
-    if prompt is None:
-        return
-    await run_edit(message, prompt)
-
-
-@dp.message(F.text)
-async def text_handler(message: Message) -> None:
-    prompt = await auth_prompt(message, message.text)
-    if prompt is None:
-        return
-
+def handle_text(chat_id: int, prompt: str) -> None:
     command = prompt.strip().lower()
 
     if command in {"/help", "help"}:
-        await message.answer(
+        tg.send_message(
+            chat_id,
             f"<b>Генерация</b>\n"
             f"<code>{settings.access_prefix} твой промпт</code>\n\n"
             f"<b>Редактирование</b>\n"
-            f"Отправь фотографию с подписью:\n"
-            f"<code>{settings.access_prefix} убери очки, остальное не меняй</code>\n\n"
+            "Отправь фотографию с подписью:\n"
+            f"<code>{settings.access_prefix} "
+            "убери очки, остальное не меняй</code>\n\n"
             f"<b>Команды</b>\n"
             f"<code>{settings.access_prefix} /status</code>\n"
             f"<code>{settings.access_prefix} /warmup</code>",
@@ -246,64 +348,77 @@ async def text_handler(message: Message) -> None:
         return
 
     if command == "/status":
-        await message.answer(
+        tg.send_message(
+            chat_id,
             f"Модель: {'✅ загружена' if engine.loaded else '⏸ ещё не загружена'}\n"
-            f"{engine.cuda_status()}"
+            f"{engine.cuda_status()}",
         )
         return
 
     if command == "/warmup":
-        status = await message.answer("⏳ Загружаю модель в GPU…")
+        status = tg.send_message(chat_id, "⏳ Загружаю модель в GPU…")
+        status_id = status["message_id"]
         try:
-            async with gpu_queue:
-                await asyncio.to_thread(engine.warmup)
-            await status.edit_text("✅ Модель загружена и готова.")
+            engine.warmup()
+            tg.edit_message(chat_id, status_id, "✅ Модель загружена и готова.")
         except Exception as exc:
             logger.exception("Warmup failed")
-            await status.edit_text(
-                f"❌ Не удалось загрузить модель:\n"
-                f"<code>{type(exc).__name__}: {html.escape(str(exc)[:500])}</code>",
-                parse_mode="HTML",
-            )
+            status_error(chat_id, status_id, exc)
         return
 
-    await run_generate(message, prompt)
+    run_generate(chat_id, prompt)
 
 
-async def preload_if_enabled() -> None:
-    if not settings.model_load_on_start:
+def handle_message(message: dict) -> None:
+    if not user_allowed(message):
         return
 
-    logger.info("MODEL_LOAD_ON_START=true, preloading model")
-    try:
-        async with gpu_queue:
-            await asyncio.to_thread(engine.warmup)
-        logger.info("Model preload complete")
-    except Exception:
-        logger.exception("Model preload failed")
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
 
+    text = message.get("text")
+    caption = message.get("caption")
 
-async def main() -> None:
-    # На части российских/облачных сетей api.telegram.org по IPv6 может
-    # зависать, хотя IPv4 работает. Принудительно используем IPv4.
-    session = AiohttpSession(timeout=60)
-    session._connector_init["family"] = socket.AF_INET
+    # /start специально не раскрывает пароль.
+    if text == "/start":
+        tg.send_message(
+            int(chat_id),
+            "Бот запущен. Для работы используй секретный префикс.",
+        )
+        return
 
-    bot = Bot(
-        token=settings.telegram_bot_token,
-        session=session,
+    has_photo = bool(message.get("photo"))
+    document = message.get("document") or {}
+    has_image_document = bool(
+        document
+        and str(document.get("mime_type", "")).startswith("image/")
     )
 
-    # Убираем старый webhook. Сетевой сбой при старте не должен убивать
-    # systemd-процесс: делаем несколько попыток.
-    webhook_deleted = False
+    if has_photo or has_image_document:
+        prompt = extract_prompt(caption)
+        if prompt is None:
+            if not settings.silent_auth_failure:
+                tg.send_message(int(chat_id), "🔒 Неверный префикс.")
+            return
+        run_edit(int(chat_id), message, prompt)
+        return
+
+    if text is not None:
+        prompt = extract_prompt(text)
+        if prompt is None:
+            if not settings.silent_auth_failure:
+                tg.send_message(int(chat_id), "🔒 Неверный префикс.")
+            return
+        handle_text(int(chat_id), prompt)
+
+
+def startup() -> None:
+    # Не даём transient network error убить systemd-процесс.
     for attempt in range(1, 6):
         try:
-            await bot.delete_webhook(
-                drop_pending_updates=False,
-                request_timeout=60,
-            )
-            webhook_deleted = True
+            tg.delete_webhook()
             break
         except Exception as exc:
             logger.warning(
@@ -312,37 +427,57 @@ async def main() -> None:
                 type(exc).__name__,
                 exc,
             )
-            await asyncio.sleep(min(5 * attempt, 20))
+            time.sleep(min(attempt * 2, 10))
 
-    if not webhook_deleted:
-        logger.warning(
-            "Could not confirm webhook deletion. Starting polling anyway; "
-            "if a webhook is configured Telegram will report a conflict."
-        )
+    me = tg.get_me()
+    logger.info("Bot @%s started via requests transport", me.get("username"))
 
     if settings.model_load_on_start:
-        asyncio.create_task(preload_if_enabled())
+        try:
+            engine.warmup()
+            logger.info("Model preload complete")
+        except Exception:
+            logger.exception("Model preload failed")
 
-    try:
-        me = await bot.get_me(request_timeout=60)
-        logger.info("Bot @%s started", me.username)
-    except Exception as exc:
-        # Сам polling aiogram умеет восстанавливать после сетевых ошибок,
-        # поэтому getMe не должен быть фатальным.
-        logger.warning(
-            "getMe failed at startup: %s: %s. Starting polling.",
-            type(exc).__name__,
-            exc,
-        )
 
-    try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-        )
-    finally:
-        await bot.session.close()
+def main() -> None:
+    startup()
+
+    offset: int | None = None
+    backoff = 2
+
+    while True:
+        try:
+            updates = tg.get_updates(offset)
+            backoff = 2
+
+            for update in updates:
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    offset = int(update_id) + 1
+
+                message = update.get("message")
+                if not message:
+                    continue
+
+                try:
+                    handle_message(message)
+                except Exception:
+                    logger.exception("Unhandled message error")
+
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
+            break
+        except Exception as exc:
+            logger.warning(
+                "Telegram polling error: %s: %s; retry in %ss",
+                type(exc).__name__,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
