@@ -1,0 +1,10 @@
+aiogram>=3.22,<4
+python-dotenv>=1.1,<2
+Pillow>=11,<13
+accelerate>=1.10
+bitsandbytes>=0.50.2
+safetensors>=0.6
+huggingface_hub>=0.35
+hf-xet>=1.1
+transformers>=5.17
+diffusers @ git+https://github.com/huggingface/diffusers.git
