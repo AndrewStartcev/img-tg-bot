@@ -427,15 +427,20 @@ def startup() -> None:
             break
         except Exception as exc:
             logger.warning(
-                "deleteWebhook attempt %s/5 failed: %s: %s",
+                "deleteWebhook attempt %s/5 failed: %s",
                 attempt,
                 type(exc).__name__,
-                exc,
             )
             time.sleep(min(attempt * 2, 10))
 
-    me = tg.get_me()
-    logger.info("Bot @%s started via requests transport", me.get("username"))
+    try:
+        me = tg.get_me()
+        logger.info("Bot @%s started via requests/IPv4 transport", me.get("username"))
+    except Exception as exc:
+        logger.warning(
+            "getMe failed at startup: %s; polling will retry",
+            type(exc).__name__,
+        )
 
     if settings.model_load_on_start:
         try:
@@ -475,9 +480,8 @@ def main() -> None:
             break
         except Exception as exc:
             logger.warning(
-                "Telegram polling error: %s: %s; retry in %ss",
+                "Telegram polling error: %s; retry in %ss",
                 type(exc).__name__,
-                exc,
                 backoff,
             )
             time.sleep(backoff)
