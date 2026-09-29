@@ -71,6 +71,7 @@ class QwenEngine:
                 cache_dir=str(self.settings.hf_home),
                 token=self.settings.hf_token,
                 low_cpu_mem_usage=True,
+                local_files_only=False,
             )
 
             pipe.to("cuda")
