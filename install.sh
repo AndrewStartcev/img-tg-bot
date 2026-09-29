@@ -44,7 +44,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
 echo "==> Ставлю системные пакеты"
 ${SUDO} apt-get update -y
-${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y \
+${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git \
   python3 \
   python3-venv \
