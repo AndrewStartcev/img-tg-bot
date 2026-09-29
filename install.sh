@@ -90,6 +90,19 @@ Environment=PYTHONUNBUFFERED=1
 Environment=TOKENIZERS_PARALLELISM=false
 Environment=HF_HUB_DISABLE_TELEMETRY=1
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+EOF
+
+# Intelion и некоторые облачные образы отдают исходящий интернет через
+# HTTP(S)-proxy в shell environment. systemd сам эти переменные не наследует,
+# поэтому переносим их в unit, если они есть.
+for proxy_var in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+  proxy_value="${!proxy_var:-}"
+  if [[ -n "${proxy_value}" ]]; then
+    printf 'Environment="%s=%s"\n' "${proxy_var}" "${proxy_value}" | ${SUDO} tee -a "${SERVICE_FILE}" >/dev/null
+  fi
+done
+
+${SUDO} tee -a "${SERVICE_FILE}" >/dev/null <<EOF
 ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/bot.py
 Restart=on-failure
 RestartSec=5
